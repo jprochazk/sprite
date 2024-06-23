@@ -28,11 +28,12 @@ export class Context {
     // update positions
     for (let i = 0; i < this.sprites.size; i++) {
       let x = this.sprites.x.get(i) + 1;
-      if (x > this.viewport.width) {
-        x = -this.spriteSize;
+      if (x - this.spriteSize / 2 > this.viewport.width) {
+        x = -this.spriteSize / 2;
       }
       this.sprites.x.set(i, x);
     }
+    this.sprites.x.bind();
     this.sprites.x.flush(); // upload data to GPU
   }
 
