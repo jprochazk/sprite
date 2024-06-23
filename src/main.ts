@@ -46,14 +46,16 @@ slider.addEventListener("input", () => {
 
 const canvasContainer = document.getElementById("canvas-container") as HTMLDivElement;
 
-let raf = 0;
+let stop = () => {};
+
 function start(renderer: typeof Context, count: number) {
+  stop();
+
   const canvas = document.createElement("canvas");
   canvas.width = canvasContainer.clientWidth;
   canvas.height = canvasContainer.clientHeight;
   canvasContainer.innerHTML = "";
   canvasContainer.appendChild(canvas);
-  cancelAnimationFrame(raf);
 
   // split count by aspect ratio of canvas
   const aspectRatio = canvas.width / canvas.height;
@@ -63,6 +65,13 @@ function start(renderer: typeof Context, count: number) {
   const ctx = new renderer(canvas);
   ctx.setup(textures, spriteGrid(rows, cols), SPRITE_SIZE);
 
+  stop = () => {
+    cancelAnimationFrame(raf);
+    canvas.remove();
+    ctx.destroy();
+  };
+
+  let raf = 0;
   function loop() {
     ctx.update();
     ctx.render();
@@ -80,7 +89,7 @@ function run() {
   }
 }
 
-const runDebounced = debounce(() => run(), 500);
+const runDebounced = debounce(() => run(), 100);
 
 sliderValue.subscribe(runDebounced);
 dropdownValue.subscribe(runDebounced);

@@ -3,11 +3,11 @@
 import { SpriteInfo } from "./common";
 
 export class Context {
-  ctx: CanvasRenderingContext2D;
-  canvas: HTMLCanvasElement;
-  textures: Map<string, ImageBitmap> = new Map();
-  sprites: Sprite[] = [];
-  spriteSize: number = 0;
+  private ctx: CanvasRenderingContext2D;
+  private canvas: HTMLCanvasElement;
+  private textures: Map<string, ImageBitmap> = new Map();
+  private sprites: Sprite[] = [];
+  private spriteSize: number = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -48,6 +48,11 @@ export class Context {
     for (const sprite of this.sprites) {
       sprite.draw(this.ctx, this.spriteSize);
     }
+  }
+
+  destroy() {
+    this.textures.clear();
+    this.sprites.length = 0;
   }
 }
 

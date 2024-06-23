@@ -4,6 +4,7 @@ export declare class Context {
   setup(textures: [string, ImageBitmap][], sprites: SpriteInfo[], spriteSize: number): void;
   update(): void;
   render(): void;
+  destroy(): void;
 }
 
 export type SpriteInfo = {

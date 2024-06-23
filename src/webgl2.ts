@@ -1,13 +1,13 @@
 import { SpriteInfo } from "./common";
 
 export class Context {
-  canvas: HTMLCanvasElement;
-  gl: WebGL2RenderingContext;
-  viewport: Viewport;
-  spriteSize: number = 1;
-  atlas!: TextureAtlas;
-  sprites!: SpriteBatch;
-  shader!: Shader;
+  private canvas: HTMLCanvasElement;
+  private gl: WebGL2RenderingContext;
+  private viewport: Viewport;
+  private spriteSize: number = 1;
+  private atlas!: TextureAtlas;
+  private sprites!: SpriteBatch;
+  private shader!: Shader;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -28,12 +28,13 @@ export class Context {
     // update positions
     for (let i = 0; i < this.sprites.size; i++) {
       let x = this.sprites.x.get(i) + 1;
-      if (x > this.viewport.width) {
-        x = -this.spriteSize;
+      // note: have to account for sprites being renderered from the center
+      // in canvas2d version they are rendered from top left corner
+      if (x - this.spriteSize / 2 > this.viewport.width) {
+        x = -this.spriteSize / 2;
       }
       this.sprites.x.set(i, x);
     }
-    this.sprites.x.flush(); // upload data to GPU
   }
 
   render() {
@@ -44,14 +45,19 @@ export class Context {
     this.viewport.height = this.canvas.height;
 
     this.gl.viewport(0, 0, this.viewport.width, this.viewport.height);
-    this.gl.clearColor(0, 0, 0, 1);
+    this.gl.clearColor(0, 0, 0, 0);
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
 
     this.shader.bind();
-    this.shader.uniforms.projection.set(this.viewport.projection());
-    this.gl.bindVertexArray(this.sprites.vao);
-    this.gl.bindTexture(this.gl.TEXTURE_2D_ARRAY, this.atlas.texture);
-    this.gl.drawArraysInstanced(this.gl.TRIANGLES, 0, 6, this.sprites.size);
+    this.shader.uniform("projection").set(this.viewport.projection());
+    this.atlas.bind(0);
+    this.sprites.draw();
+  }
+
+  destroy() {
+    this.atlas.destroy();
+    this.shader.destroy();
+    this.sprites.destroy();
   }
 }
 
@@ -159,11 +165,13 @@ function ortho(
 
 // NOTE: All textures are assumed to be the same size
 class TextureAtlas {
-  nameToId: Map<string, number>;
-  texture: WebGLTexture;
+  private gl: WebGL2RenderingContext;
+  private nameToId: Map<string, number>;
+  private texture: WebGLTexture;
 
+  // create an atlas which is a 3D texture, with each image on its own layer in the 3D texture
   constructor(gl: WebGL2RenderingContext, images: [string, ImageBitmap][]) {
-    // create an atlas which is a 3D texture, with each image on its own layer in the 3D texture
+    this.gl = gl;
     this.nameToId = new Map();
     this.texture = gl.createTexture()!;
 
@@ -204,17 +212,36 @@ class TextureAtlas {
     }
     return id;
   }
+
+  private index: number = -1;
+  bind(index: number) {
+    this.index = index;
+    this.gl.activeTexture(this.gl.TEXTURE0 + index);
+    this.gl.bindTexture(this.gl.TEXTURE_2D_ARRAY, this.texture);
+  }
+
+  unbind() {
+    this.gl.activeTexture(this.gl.TEXTURE0 + this.index);
+    this.gl.bindTexture(this.gl.TEXTURE_2D_ARRAY, null);
+  }
+
+  destroy() {
+    this.gl.deleteTexture(this.texture);
+    this.nameToId.clear();
+    this.index = -1;
+  }
 }
 
 class SpriteBatch {
+  gl: WebGL2RenderingContext;
+
   size: number;
 
-  quad: Buffer<Float32Array>;
-  tid: Buffer<Uint8Array>;
-  x: Buffer<Float32Array>;
-  y: Buffer<Float32Array>;
-
-  vao: WebGLVertexArrayObject;
+  quad: Buffer<Float32>;
+  tid: Buffer<Uint8>;
+  x: Buffer<Float32>;
+  y: Buffer<Float32>;
+  attribs: AttributeSet;
 
   constructor(
     gl: WebGL2RenderingContext,
@@ -222,6 +249,8 @@ class SpriteBatch {
     spriteSize: number,
     atlas: TextureAtlas
   ) {
+    this.gl = gl;
+
     const tid = new Uint8Array(sprites.map((s) => atlas.getId(s.texture)!));
     const x = new Float32Array(sprites.map((s) => s.x + spriteSize / 2));
     const y = new Float32Array(sprites.map((s) => s.y + spriteSize / 2));
@@ -232,39 +261,47 @@ class SpriteBatch {
     this.x = new Buffer(gl, x, "dynamic");
     this.y = new Buffer(gl, y, "dynamic");
 
-    // TODO: use `VertexArray` for this
-    this.vao = gl.createVertexArray()!;
-    gl.bindVertexArray(this.vao);
+    this.attribs = new AttributeSet(gl, [
+      {
+        buffer: this.quad,
+        attributes: [vec2Attrib(0), vec2Attrib(1)],
+      },
+      {
+        buffer: this.tid,
+        attributes: [ubyteAttrib(2, 1)],
+      },
+      {
+        buffer: this.x,
+        attributes: [floatAttrib(3, 1)],
+      },
+      {
+        buffer: this.y,
+        attributes: [floatAttrib(4, 1)],
+      },
+    ]);
+  }
 
-    this.quad.bind();
-    gl.enableVertexAttribArray(0); // vec2[0]
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 4 * 4, 0);
-    gl.enableVertexAttribArray(1); // vec2[1]
-    gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 4 * 4, 2 * 4);
+  draw() {
+    this.x.flush();
+    this.y.flush();
 
-    this.tid.bind();
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_BYTE, 1, 0);
-    gl.vertexAttribDivisor(2, 1);
+    this.attribs.bind();
+    this.gl.drawArraysInstanced(this.gl.TRIANGLES, 0, 6, this.size);
+  }
 
-    this.x.bind();
-    gl.enableVertexAttribArray(3);
-    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 4, 0);
-    gl.vertexAttribDivisor(3, 1);
-
-    this.y.bind();
-    gl.enableVertexAttribArray(4);
-    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, 4, 0);
-    gl.vertexAttribDivisor(4, 1);
-
-    gl.bindVertexArray(null);
+  destroy() {
+    this.quad.destroy();
+    this.tid.destroy();
+    this.x.destroy();
+    this.y.destroy();
+    this.attribs.destroy();
   }
 }
 
-class Buffer<Data extends TypedArray> {
-  gl: WebGL2RenderingContext;
-  buffer: WebGLBuffer;
-  data: Data;
+class Buffer<Data extends BufferType> {
+  private gl: WebGL2RenderingContext;
+  private buffer: WebGLBuffer;
+  private data: Data;
 
   constructor(gl: WebGL2RenderingContext, data: Data, mode: "static" | "dynamic") {
     this.gl = gl;
@@ -275,32 +312,50 @@ class Buffer<Data extends TypedArray> {
     gl.bufferData(gl.ARRAY_BUFFER, data, mode === "static" ? gl.STATIC_DRAW : gl.DYNAMIC_DRAW);
   }
 
+  private dirty = false;
+
   get(offset: number) {
     return this.data[offset];
   }
 
   set(offset: number, value: number) {
     this.data[offset] = value;
+    this.dirty = true;
   }
 
   bind() {
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.buffer);
   }
 
+  unbind() {
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, null);
+  }
+
   flush() {
+    if (!this.dirty) {
+      return;
+    }
+
+    this.bind();
     this.gl.bufferData(this.gl.ARRAY_BUFFER, this.data, this.gl.DYNAMIC_DRAW);
+  }
+
+  destroy() {
+    this.gl.deleteBuffer(this.buffer);
+    this.data = null!;
   }
 }
 
-type TypedArray =
-  | Int8Array
-  | Uint8Array
-  | Int16Array
-  | Uint16Array
-  | Int32Array
-  | Uint32Array
-  | Float32Array
-  | Float64Array;
+type Int8 = Int8Array;
+type Uint8 = Uint8Array;
+type Int16 = Int16Array;
+type Uint16 = Uint16Array;
+type Int32 = Int32Array;
+type Uint32 = Uint32Array;
+type Float32 = Float32Array;
+type Float64 = Float64Array;
+
+type BufferType = Int8 | Uint8 | Int16 | Uint16 | Int32 | Uint32 | Float32 | Float64;
 
 type UniformSetter = (data: number | number[]) => void;
 
@@ -313,9 +368,9 @@ type Uniform = {
 };
 
 export class Shader {
-  gl: WebGL2RenderingContext;
-  program: WebGLProgram;
-  uniforms: { [name: string]: Uniform };
+  private gl: WebGL2RenderingContext;
+  private program: WebGLProgram;
+  private uniforms: { [name: string]: Uniform };
 
   constructor(gl: WebGL2RenderingContext, vertex: string, fragment: string) {
     this.gl = gl;
@@ -345,12 +400,22 @@ export class Shader {
     this.unbind();
   }
 
+  uniform(name: string): Readonly<Uniform> {
+    return this.uniforms[name];
+  }
+
   bind() {
     this.gl.useProgram(this.program);
   }
 
   unbind() {
     this.gl.useProgram(null);
+  }
+
+  destroy() {
+    this.gl.deleteProgram(this.program);
+    this.program = null!;
+    this.uniforms = null!;
   }
 }
 
@@ -632,74 +697,188 @@ function stringifyType(type: number): string {
   }
 }
 
-export interface BufferDescriptor {
+interface AttributeArrayDescriptor {
+  /** Buffer to bind the given attributes to */
+  buffer: Buffer<BufferType>;
+  attributes: AttributeDescriptor[];
+}
+
+interface AttributeDescriptor {
   /**
    * Attribute index
    *
    * e.g. for attribute `layout(location = 0) in vec2 POSITION` it would be `0`.
    */
   location: number;
+
   /**
    * Number of `baseType` in the compound type.
    *
    * e.g. for attribute `layout(location = 0) in vec2 POSITION`, it would be `2`, because it's a `vec2`.
    */
   arraySize: number;
+
   /**
    * Base type of the attribute
    *
    * e.g. for attribute `layout(location = 0) in vec2 POSITION`, it would be `GL.FLOAT`, because it's a `vec2`, which is comprised of two floats.
    */
   baseType: GLenum;
+
   /**
    * Whether the value should be normalized to the (0, 1) range.
+   *
+   * Ignored for integer types.
    */
   normalized: boolean;
+
+  divisor: number;
 }
 
-function sizeof(type: GLenum) {
+function floatAttrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 1, baseType: FloatT, normalized: false, divisor };
+}
+
+function vec2Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 2, baseType: FloatT, normalized: false, divisor };
+}
+
+/* function vec3Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 3, baseType: FloatT, normalized: false, divisor };
+}
+
+function vec4Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 4, baseType: FloatT, normalized: false, divisor };
+}
+
+function intAttrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 1, baseType: IntT, normalized: false, divisor };
+}
+
+function ivec2Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 2, baseType: IntT, normalized: false, divisor };
+}
+
+function ivec3Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 3, baseType: IntT, normalized: false, divisor };
+}
+
+function ivec4Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 4, baseType: IntT, normalized: false, divisor };
+} */
+
+function ubyteAttrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 1, baseType: UnsignedByteT, normalized: false, divisor };
+}
+
+/* function uintAttrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 1, baseType: UnsignedIntT, normalized: false, divisor };
+}
+
+function uvec2Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 2, baseType: UnsignedIntT, normalized: false, divisor };
+}
+
+function uvec3Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 3, baseType: UnsignedIntT, normalized: false, divisor };
+}
+
+function uvec4Attrib(location: number, divisor: number = 0): AttributeDescriptor {
+  return { location, arraySize: 4, baseType: UnsignedIntT, normalized: false, divisor };
+} */
+
+const ByteT = 0x1400;
+const UnsignedByteT = 0x1401;
+const ShortT = 0x1402;
+const UnsignedShortT = 0x1403;
+const IntT = 0x1404;
+const UnsignedIntT = 0x1405;
+const FloatT = 0x1406;
+
+function attribSizeOf(type: GLenum) {
   switch (type) {
-    case 0x1400:
-      return /* byte */ 1;
-    case 0x1401:
-      return /* unsigned byte */ 1;
-    case 0x8b56:
-      return /* bool */ 1;
-    case 0x1402:
-      return /* short */ 2;
-    case 0x1403:
-      return /* unsigned short */ 2;
-    case 0x1404:
-      return /* int */ 4;
-    case 0x1405:
-      return /* unsigned int */ 4;
-    case 0x1406:
-      return /* float */ 4;
+    case ByteT:
+    case UnsignedByteT:
+      return 1;
+    case ShortT:
+    case UnsignedShortT:
+      return 2;
+    case IntT:
+    case UnsignedIntT:
+    case FloatT:
+      return 4;
     default:
-      throw new Error(`Unknown type: ${type}`);
+      throw new Error(`Unknown base type: ${type}`);
   }
 }
 
-// TODO: make this work with:
-//       - multiple buffers
-//       - interleaved and separate buffers
-//       - instanced rendering
-export class VertexArray {
+function attribIsInt(type: GLenum) {
+  switch (type) {
+    case ByteT:
+    case UnsignedByteT:
+    case ShortT:
+    case UnsignedShortT:
+    case IntT:
+    case UnsignedIntT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+export class AttributeSet {
   gl: WebGL2RenderingContext;
   vao: WebGLVertexArrayObject;
 
-  constructor(
-    gl: WebGL2RenderingContext,
-    buffers: { buffer: Buffer<TypedArray>; descriptors: BufferDescriptor[] }[]
-  ) {
+  constructor(gl: WebGL2RenderingContext, descriptors: AttributeArrayDescriptor[]) {
     this.gl = gl;
     this.vao = gl.createVertexArray()!;
 
-    if (import.meta.env.DEV && buffers.length === 0) {
-      throw new Error("No buffers provided");
+    if (descriptors.length === 0) {
+      throw new Error("No descriptors provided");
     }
 
     gl.bindVertexArray(this.vao);
+
+    for (const descriptor of descriptors) {
+      let stride = 0;
+      for (const attribute of descriptor.attributes) {
+        stride += attribSizeOf(attribute.baseType) * attribute.arraySize;
+      }
+
+      descriptor.buffer.bind();
+
+      let offset = 0;
+      for (const attribute of descriptor.attributes) {
+        gl.enableVertexAttribArray(attribute.location);
+        if (attribIsInt(attribute.baseType)) {
+          gl.vertexAttribIPointer(
+            attribute.location,
+            attribute.arraySize,
+            attribute.baseType,
+            stride,
+            offset
+          );
+        } else {
+          gl.vertexAttribPointer(
+            attribute.location,
+            attribute.arraySize,
+            attribute.baseType,
+            attribute.normalized,
+            stride,
+            offset
+          );
+        }
+
+        if (attribute.divisor !== 0) {
+          gl.vertexAttribDivisor(attribute.location, attribute.divisor);
+        }
+
+        offset += attribSizeOf(attribute.baseType) * attribute.arraySize;
+      }
+
+      descriptor.buffer.unbind();
+    }
 
     gl.bindVertexArray(null);
   }
@@ -710,6 +889,10 @@ export class VertexArray {
 
   unbind() {
     this.gl.bindVertexArray(null);
+  }
+
+  destroy() {
+    this.gl.deleteVertexArray(this.vao);
   }
 }
 
