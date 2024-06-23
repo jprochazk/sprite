@@ -12,7 +12,7 @@ export class Context {
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.gl = canvas.getContext("webgl2")!;
-    this.viewport = new Viewport(canvas.width, canvas.height);
+    this.viewport = new Viewport(canvas);
   }
 
   setup(textures: [string, ImageBitmap][], sprites: SpriteInfo[], spriteSize: number) {
@@ -26,7 +26,7 @@ export class Context {
 
   update() {
     // update positions
-    for (let i = 0; i < this.sprites.size; i++) {
+    for (let i = 0; i < this.sprites.instances; i++) {
       let x = this.sprites.x.get(i) + 1;
       // note: have to account for sprites being renderered from the center
       // in canvas2d version they are rendered from top left corner
@@ -38,19 +38,19 @@ export class Context {
   }
 
   render() {
-    this.canvas.width = this.canvas.clientWidth;
-    this.canvas.height = this.canvas.clientHeight;
+    this.viewport.resize(this.canvas);
 
-    this.viewport.width = this.canvas.width;
-    this.viewport.height = this.canvas.height;
-
+    // update the viewport and clear the screen
     this.gl.viewport(0, 0, this.viewport.width, this.viewport.height);
     this.gl.clearColor(0, 0, 0, 0);
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
 
+    // bind the shader and update the uniforms
     this.shader.bind();
-    this.shader.uniform("projection").set(this.viewport.projection());
+    this.shader.setUniform("projection", this.viewport.projection());
+    // bind the atlas to texture slot 0
     this.atlas.bind(0);
+    // draw the sprites
     this.sprites.draw();
   }
 
@@ -61,18 +61,7 @@ export class Context {
   }
 }
 
-// quad attributes:
-// - position: vec2
-// - texcoord: vec2
-// per-instance attributes:
-// - tid: uint8
-// - x: float, world space
-// - y: float, world space
-// uniforms:
-// - projection: mat4
-// - atlas: sampler2DArray
-
-// no index buffer, use 6 vertices. anchor is top-left
+// Anchor is top-left
 // prettier-ignore
 const QUAD = new Float32Array([
   // X, Y, U, V
@@ -133,16 +122,27 @@ void main() {
 
 // keeps track of canvas size and produces a projection matrix
 class Viewport {
-  width: number;
-  height: number;
+  private canvas: HTMLCanvasElement;
 
-  constructor(width: number, height: number) {
-    this.width = width;
-    this.height = height;
+  constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
+  }
+
+  get width() {
+    return this.canvas.width;
+  }
+
+  get height() {
+    return this.canvas.height;
+  }
+
+  resize(canvas: HTMLCanvasElement) {
+    canvas.width = canvas.clientWidth;
+    canvas.height = canvas.clientHeight;
   }
 
   projection() {
-    return ortho(0, this.width, this.height, 0, -1, 1);
+    return ortho(0, this.canvas.width, this.canvas.height, 0, -1, 1);
   }
 }
 
@@ -163,14 +163,37 @@ function ortho(
   ];
 }
 
-// NOTE: All textures are assumed to be the same size
+/**
+ * A texture atlas which stores multiple images in a single 2D texture array.
+ *
+ * All images must have the same dimensions.
+ */
 class TextureAtlas {
   private gl: WebGL2RenderingContext;
   private nameToId: Map<string, number>;
+  // Note: you can awlays bind a texture directly, but it's also possible
+  //       to use a sampler to change how a texture is handled by the GPU
+  //       without creating a new texture.
   private texture: WebGLTexture;
 
-  // create an atlas which is a 3D texture, with each image on its own layer in the 3D texture
   constructor(gl: WebGL2RenderingContext, images: [string, ImageBitmap][]) {
+    if (images.length === 0) {
+      throw new Error("Cannot create texture atlas: no images provided");
+    }
+
+    // check that all images have the same dimensions
+    const firstImage = images[0][1];
+    let errors = [];
+    for (let i = 1; i < images.length; i++) {
+      const [src, image] = images[i];
+      if (image.width !== firstImage.width || image.height !== firstImage.height) {
+        errors.push(`${src} has different dimensions`);
+      }
+    }
+    if (errors.length > 0) {
+      throw new Error(`Cannot create texture atlas:\n${errors.join(", ")}`);
+    }
+
     this.gl = gl;
     this.nameToId = new Map();
     this.texture = gl.createTexture()!;
@@ -232,15 +255,29 @@ class TextureAtlas {
   }
 }
 
+/**
+ * A batch of sprites to be rendered.
+ *
+ * We use instanced rendering to render all sprites in a single draw call.
+ *
+ * Each sprite is rendered as a quad, with a per-instance texture ID and position.
+ */
 class SpriteBatch {
   gl: WebGL2RenderingContext;
 
-  size: number;
+  instances: number;
 
+  // The base quad
   quad: Buffer<Float32>;
+
+  // Per-instance texture ID
   tid: Buffer<Uint8>;
+
+  // Per-instance 2D position
   x: Buffer<Float32>;
   y: Buffer<Float32>;
+
+  // Attribute set, used to bind the above buffers to the shader.
   attribs: AttributeSet;
 
   constructor(
@@ -255,7 +292,7 @@ class SpriteBatch {
     const x = new Float32Array(sprites.map((s) => s.x + spriteSize / 2));
     const y = new Float32Array(sprites.map((s) => s.y + spriteSize / 2));
 
-    this.size = sprites.length;
+    this.instances = sprites.length;
     this.quad = new Buffer(gl, QUAD, "static");
     this.tid = new Buffer(gl, tid, "static");
     this.x = new Buffer(gl, x, "dynamic");
@@ -286,7 +323,7 @@ class SpriteBatch {
     this.y.flush();
 
     this.attribs.bind();
-    this.gl.drawArraysInstanced(this.gl.TRIANGLES, 0, 6, this.size);
+    this.gl.drawArraysInstanced(this.gl.TRIANGLES, 0, 6, this.instances);
   }
 
   destroy() {
@@ -298,11 +335,32 @@ class SpriteBatch {
   }
 }
 
+/**
+ * A simple wrapper around a WebGL buffer, which stores the data
+ * both CPU-side and GPU-side, with the ability to update the data
+ * on the CPU and synchronize it with the GPU.
+ */
 class Buffer<Data extends BufferType> {
   private gl: WebGL2RenderingContext;
   private buffer: WebGLBuffer;
   private data: Data;
 
+  /**
+   *
+   * The `mode` parameter is used to determine how the buffer will be used:
+   * - `static` is for data which does not change.
+   * - `dynamic` is for data which changes frequently.
+   *
+   * `static` does not mean the data is immutable, it just means that the data
+   * is not expected to change frequently, and updating it frequently may result
+   * in worse performance.
+   *
+   * `dynamic` means that the data is expected to change frequently, and the buffer
+   * will be optimized for frequent updates.
+   *
+   * In practice, modern GPUs are very good at handling dynamic data, so the
+   * `mode` argument does not have a huge impact on performance.
+   */
   constructor(gl: WebGL2RenderingContext, data: Data, mode: "static" | "dynamic") {
     this.gl = gl;
     this.buffer = gl.createBuffer()!;
@@ -318,6 +376,12 @@ class Buffer<Data extends BufferType> {
     return this.data[offset];
   }
 
+  /**
+   * Update the data on the CPU-side.
+   *
+   * `flush` must be called at some point before any draw calls
+   * to synchronize the data with the GPU.
+   */
   set(offset: number, value: number) {
     this.data[offset] = value;
     this.dirty = true;
@@ -331,6 +395,9 @@ class Buffer<Data extends BufferType> {
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, null);
   }
 
+  /**
+   * Synchronize the CPU-side data with the GPU.
+   */
   flush() {
     if (!this.dirty) {
       return;
@@ -360,11 +427,11 @@ type BufferType = Int8 | Uint8 | Int16 | Uint16 | Int32 | Uint32 | Float32 | Flo
 type UniformSetter = (data: number | number[]) => void;
 
 type Uniform = {
-  readonly name: string;
-  readonly size: GLint;
-  readonly type: string;
-  readonly location: WebGLUniformLocation;
-  readonly set: UniformSetter;
+  name: string;
+  size: GLint;
+  type: string;
+  location: WebGLUniformLocation;
+  set: UniformSetter;
 };
 
 export class Shader {
@@ -400,8 +467,12 @@ export class Shader {
     this.unbind();
   }
 
-  uniform(name: string): Readonly<Uniform> {
-    return this.uniforms[name];
+  setUniform(name: string, data: number | number[]) {
+    const uniform = this.uniforms[name];
+    if (uniform === undefined) {
+      throw new Error(`Cannot find uniform ${name}`);
+    }
+    uniform.set(data);
   }
 
   bind() {
@@ -419,6 +490,11 @@ export class Shader {
   }
 }
 
+/**
+ * Builds a human-readable error message from a shader.
+ *
+ * This assumes that the shader has failed to compile, and has a non-null error log.
+ */
 function buildShaderErrorMessage(gl: WebGL2RenderingContext, shader: WebGLShader): string {
   const source = gl.getShaderSource(shader);
   const log = gl.getShaderInfoLog(shader);
@@ -465,6 +541,10 @@ function buildShaderErrorMessage(gl: WebGL2RenderingContext, shader: WebGLShader
   return lines.join("\n");
 }
 
+// it's possible to compile shaders in parallel, but i didn't bother including that
+// as it's overkill for the tiny shader we're using here.
+// if you had a more complex shader, or many variants of a shader which you generate
+// at runtime, you'd definitely want to compile them in parallel.
 function compileShader(gl: WebGL2RenderingContext, source: string, type: GLenum): WebGLShader {
   const shader = gl.createShader(type)!;
   gl.shaderSource(shader, source);
@@ -492,6 +572,10 @@ function linkProgram(
   return program;
 }
 
+// this function is used to create a setter function for a uniform
+// based on its type. it's a bit verbose, but it's the most efficient
+// way to handle all uniform types generically in webgl, as the
+// result is a simple function call with no branching.
 function createSetter(
   gl: WebGL2RenderingContext,
   type: number,
@@ -586,9 +670,8 @@ function createSetter(
       const setterFn = gl[setter].bind(gl);
       return function (data) {
         if (import.meta.env.DEV && typeof data !== "number") {
-          throw new Error(
-            `Invalid uniform data: expected ${stringifyType(type)}, got ${typeof data}`
-          );
+          const dataType = Array.isArray(data) ? `${typeof data[0]}[${data.length}]` : typeof data;
+          throw new Error(`Invalid uniform data: expected ${stringifyType(type)}, got ${dataType}`);
         }
         setterFn(location, data);
       };
@@ -598,9 +681,8 @@ function createSetter(
       const setterFn = gl[setter].bind(gl);
       return function (data) {
         if (import.meta.env.DEV && (!Array.isArray(data) || data.length !== typeInfo[1])) {
-          throw new Error(
-            `Invalid uniform data: expected ${stringifyType(type)}, got ${typeof data}`
-          );
+          const dataType = Array.isArray(data) ? `${typeof data[0]}[${data.length}]` : typeof data;
+          throw new Error(`Invalid uniform data: expected ${stringifyType(type)}, got ${dataType}`);
         }
         // @ts-ignore
         setterFn(location, data);
@@ -611,9 +693,8 @@ function createSetter(
       const setterFn = gl[setter].bind(gl);
       return function (data) {
         if (import.meta.env.DEV && (!Array.isArray(data) || data.length !== typeInfo[1])) {
-          throw new Error(
-            `Invalid uniform data: expected ${stringifyType(type)}, got ${typeof data}`
-          );
+          const dataType = Array.isArray(data) ? `${typeof data[0]}[${data.length}]` : typeof data;
+          throw new Error(`Invalid uniform data: expected ${stringifyType(type)}, got ${dataType}`);
         }
         // @ts-ignore
         setterFn(location, false, data);
@@ -697,12 +778,18 @@ function stringifyType(type: number): string {
   }
 }
 
+/**
+ * Describes a set of attributes to be bound to a VAO.
+ */
 interface AttributeArrayDescriptor {
   /** Buffer to bind the given attributes to */
   buffer: Buffer<BufferType>;
   attributes: AttributeDescriptor[];
 }
 
+/**
+ * Describes a single attribute to be bound to a VAO.
+ */
 interface AttributeDescriptor {
   /**
    * Attribute index
@@ -732,6 +819,16 @@ interface AttributeDescriptor {
    */
   normalized: boolean;
 
+  /**
+   * The divisor for instanced rendering.
+   *
+   * If `0`, the attribute is advanced for each vertex.
+   * If `1`, the attribute is advanced for each instance.
+   * If `N>1`, the attribute is advanced for every `N` instances.
+   *
+   * This allows you to for example set the texture ID for each instance separately,
+   * while sharing the same base geometry.
+   */
   divisor: number;
 }
 
@@ -743,49 +840,13 @@ function vec2Attrib(location: number, divisor: number = 0): AttributeDescriptor 
   return { location, arraySize: 2, baseType: FloatT, normalized: false, divisor };
 }
 
-/* function vec3Attrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 3, baseType: FloatT, normalized: false, divisor };
-}
-
-function vec4Attrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 4, baseType: FloatT, normalized: false, divisor };
-}
-
-function intAttrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 1, baseType: IntT, normalized: false, divisor };
-}
-
-function ivec2Attrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 2, baseType: IntT, normalized: false, divisor };
-}
-
-function ivec3Attrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 3, baseType: IntT, normalized: false, divisor };
-}
-
-function ivec4Attrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 4, baseType: IntT, normalized: false, divisor };
-} */
+// Note: For some types like `uint`, the data can actually be stored using
+//       smaller bit widths, like `ubyte` or `ushort`.
+//       for integer types, the GPU sign-extends the value to 32-bits.
 
 function ubyteAttrib(location: number, divisor: number = 0): AttributeDescriptor {
   return { location, arraySize: 1, baseType: UnsignedByteT, normalized: false, divisor };
 }
-
-/* function uintAttrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 1, baseType: UnsignedIntT, normalized: false, divisor };
-}
-
-function uvec2Attrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 2, baseType: UnsignedIntT, normalized: false, divisor };
-}
-
-function uvec3Attrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 3, baseType: UnsignedIntT, normalized: false, divisor };
-}
-
-function uvec4Attrib(location: number, divisor: number = 0): AttributeDescriptor {
-  return { location, arraySize: 4, baseType: UnsignedIntT, normalized: false, divisor };
-} */
 
 const ByteT = 0x1400;
 const UnsignedByteT = 0x1401;
@@ -795,6 +856,9 @@ const IntT = 0x1404;
 const UnsignedIntT = 0x1405;
 const FloatT = 0x1406;
 
+/**
+ * Returns the size in bytes of the given base type.
+ */
 function attribSizeOf(type: GLenum) {
   switch (type) {
     case ByteT:
@@ -812,6 +876,17 @@ function attribSizeOf(type: GLenum) {
   }
 }
 
+/**
+ * Returns whether the given base type is an integer type.
+ *
+ * This is used to determine if integer pointers should be used over floating point pointers.
+ *
+ * The difference between the two is that the GPU reads integers as-is, but floating point
+ * values may be normalized if requested.
+ *
+ * You _could_ pass integer data to a floating point pointer, but the GPU would interpret it as
+ * a floating point value, which may not be what you want.
+ */
 function attribIsInt(type: GLenum) {
   switch (type) {
     case ByteT:
@@ -826,6 +901,9 @@ function attribIsInt(type: GLenum) {
   }
 }
 
+/**
+ * A set of attributes to be bound to a VAO.
+ */
 export class AttributeSet {
   gl: WebGL2RenderingContext;
   vao: WebGLVertexArrayObject;
@@ -841,6 +919,7 @@ export class AttributeSet {
     gl.bindVertexArray(this.vao);
 
     for (const descriptor of descriptors) {
+      // calculate stride
       let stride = 0;
       for (const attribute of descriptor.attributes) {
         stride += attribSizeOf(attribute.baseType) * attribute.arraySize;
@@ -848,6 +927,7 @@ export class AttributeSet {
 
       descriptor.buffer.bind();
 
+      // for each attribute, bind it to the VAO, and set the pointer
       let offset = 0;
       for (const attribute of descriptor.attributes) {
         gl.enableVertexAttribArray(attribute.location);
@@ -870,6 +950,7 @@ export class AttributeSet {
           );
         }
 
+        // if the attribute is instanced, set the divisor
         if (attribute.divisor !== 0) {
           gl.vertexAttribDivisor(attribute.location, attribute.divisor);
         }
