@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sprites</title>
+  </head>
+  <body>
+    <div id="app">
+      <div id="menu">
+        <select id="renderer">
+          <option value="canvas2d">Canvas2D</option>
+          <option value="webgl2">WebGL2</option>
+        </select>
+        <span>
+          <input id="count" type="range" min="0" max="1000" step="10" value="10" />
+          <label for="count">10</label>
+        </span>
+      </div>
+      <div id="canvas-container"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+
